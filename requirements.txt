@@ -1,0 +1,8 @@
+pandas
+numpy
+yfinance
+matplotlib
+lxml
+requests
+pyarrow
+python-dotenv
