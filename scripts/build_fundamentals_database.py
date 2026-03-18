@@ -20,29 +20,6 @@ from typing import Any
 import pandas as pd
 import requests
 
-try:  # pragma: no cover - exercised when dotenv is available in runtime env
-    from dotenv import load_dotenv as _dotenv_load
-except Exception:  # pragma: no cover - fallback path
-    def _dotenv_load(dotenv_path: Path, override: bool = False) -> bool:
-        p = Path(dotenv_path)
-        if not p.exists():
-            return False
-        loaded_any = False
-        for raw in p.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            key = k.strip()
-            val = v.strip()
-            if not key:
-                continue
-            if (not override) and (key in os.environ):
-                continue
-            os.environ[key] = val
-            loaded_any = True
-        return loaded_any
-
 from quant_lab.data.fmp_fundamentals import (
     INTERNAL_COLUMNS as FMP_INTERNAL_COLUMNS,
     build_fmp_payload_summary,
@@ -56,6 +33,7 @@ from quant_lab.data.tiingo_fundamentals import (
     fetch_tiingo_fundamentals_frame,
     normalize_internal_fundamentals_frame as normalize_tiingo_internal_fundamentals_frame,
 )
+from quant_lab.utils.env import get_required_env, load_project_env
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -95,24 +73,16 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def _load_dotenv_from_repo_root(repo_root: Path | None = None) -> bool:
-    repo_root = Path(repo_root) if repo_root is not None else Path(__file__).resolve().parents[1]
-    env_path = repo_root / ".env"
-    return bool(_dotenv_load(dotenv_path=env_path, override=False))
+    return load_project_env(repo_root=repo_root) is not None
 
 
 def _resolve_api_key(source: str, fmp_cli: str | None, tiingo_cli: str | None) -> str:
     src = str(source).strip().lower()
     if src == "fmp":
-        key = str(fmp_cli or "").strip() or str(os.getenv("FMP_API_KEY", "")).strip()
-        if not key:
-            raise ValueError("FMP API key is missing. Provide --fmp-api-key or set FMP_API_KEY in repo-root .env.")
+        key = str(fmp_cli or "").strip() or get_required_env("FMP_API_KEY")
         return key
     if src == "tiingo":
-        key = str(tiingo_cli or "").strip() or str(os.getenv("TIINGO_API_KEY", "")).strip()
-        if not key:
-            raise ValueError(
-                "Tiingo API key is missing. Provide --tiingo-api-key or set TIINGO_API_KEY in repo-root .env."
-            )
+        key = str(tiingo_cli or "").strip() or get_required_env("TIINGO_API_KEY")
         return key
     raise ValueError(f"Unsupported source: {source}")
 
@@ -333,6 +303,13 @@ def main() -> None:
         out = normalize_fmp_internal_fundamentals_frame(combined)
     else:
         out = normalize_tiingo_internal_fundamentals_frame(combined)
+
+    corrected_count = int(out.attrs.get("available_date_floor_corrections", 0))
+    if corrected_count > 0:
+        print(
+            "[INFO] Corrected fundamentals rows with available_date earlier than period_end: "
+            f"{corrected_count}"
+        )
 
     out_path = Path(str(args.output))
     out_path.parent.mkdir(parents=True, exist_ok=True)

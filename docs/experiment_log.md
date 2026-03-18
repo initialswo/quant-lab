@@ -1238,4 +1238,129 @@ PYTHONPATH=src python scripts/run_sleeve_allocation_sweep.py
 ### Initial Interpretation
 - Allocation tilts improved Sharpe versus equal sleeves in this run.
 - Best result came from `rev_tilt_2`.
-- Results bundle: `results/sleeve_allocation_sweep/20260312_141634`
+
+
+## QL-ALPHA-001 — Quality + Investment Factor Test
+
+**Date:** 2026-03-17
+**Category:** Alpha
+
+### Hypothesis
+
+Adding the investment factor (asset_growth) will improve the quality sleeve by capturing firms with conservative investment behavior.
+
+### Baseline
+
+* Factors: gross_profitability (0.70), reversal_1m (0.30)
+
+### Test
+
+* Factors: gross_profitability (0.60), reversal_1m (0.25), asset_growth (0.15)
+
+### Configuration
+
+* Universe: liquid_us (dynamic)
+* Rebalance: weekly
+* Top N: 75
+* Weighting: inv_vol
+* Costs: 10 bps
+* Aggregation: linear
+
+### Results
+
+* Baseline Sharpe: 0.9514
+
+* Test Sharpe: 0.9421
+
+* Δ Sharpe: -0.0094
+
+* Baseline CAGR: 0.1477
+
+* Test CAGR: 0.1437
+
+* Δ CAGR: -0.0041
+
+* MaxDD improved slightly
+
+* Volatility decreased slightly
+
+* Turnover decreased slightly
+
+### Interpretation
+
+Adding asset_growth reduced Sharpe and CAGR while slightly improving risk metrics. The factor does not enhance the existing quality + pullback signal.
+
+### Decision
+
+Reject
+
+### Decision Rationale
+
+Adding asset_growth reduced risk-adjusted returns without meaningful improvement in drawdown. The current alpha appears driven by profitability and reversal rather than broader factor stacking.
+
+Promoted Quality Sleeve v2 as the current lead quality sleeve.
+
+Compared with the prior baseline (gross_profitability 0.70 + reversal_1m 0.30), the multi-horizon timing version materially improved full-period Sharpe and CAGR while slightly improving volatility and drawdown. The best tested configuration was gross_profitability 0.70, reversal_1m 0.05, reversal_5d 0.25.
+
+Validation was acceptable:
+- 20 bps cost stress reduced Sharpe from 1.018 to 0.922 but did not break the strategy
+- subperiod Sharpes remained positive across 2010–2016, 2016–2020, and 2020–2024
+- no evidence of regime-specific collapse
+
+Conclusion: short-term reversal is the dominant timing component, but a small medium-term reversal weight remains beneficial. This sleeve is now the promoted quality sleeve candidate and should be treated as the benchmark quality specification going forward.
+
+Promoted Portfolio v1 as the validated baseline portfolio.
+
+Fixed specification:
+- Quality sleeve: gross_profitability 0.70, reversal_1m 0.05, reversal_5d 0.25
+- Momentum sleeve: momentum_12_1 1.00
+- Portfolio weights: quality 90%, momentum 10%
+
+Walkforward validation across 2010–2014, 2015–2019, and 2020–2024 showed no regime collapse. Performance was strongest in 2010–2014 and 2020–2024, with a weaker but still positive 2015–2019 period. Full-period metrics remained strong, with Sharpe around 1.01 and max drawdown around -14.6%.
+
+Conclusion: Portfolio v1 is robust enough to serve as the current benchmark portfolio for future research.
+
+## QL-STATE-FREEZE-001 — Quality v2 Baseline
+
+### Final Strategy Definition
+gross_profitability = 0.70
+reversal_1m        = 0.05
+reversal_5d        = 0.25
+
+Universe:
+- liquid_us (dynamic)
+- min_price >= 5
+- ADV20 >= 10M
+
+Portfolio Construction:
+- top_n = 75
+- rebalance = weekly
+- weighting = inv_vol
+- costs = 10 bps
+
+### Performance (2010–2024)
+CAGR: 0.1574  
+Vol: 0.1554  
+Sharpe: 1.0184  
+MaxDD: -0.1507  
+
+### Portfolio Decision
+Momentum sleeve removed.
+Optimal allocation = 100% quality.
+
+### Rejected Enhancements
+- ROA → decreased Sharpe
+- asset_growth → decreased Sharpe
+- low_vol → weak returns
+- standalone reversal → weak Sharpe
+- time-series momentum → poor drawdowns
+- ranked trend → low Sharpe, high drawdown
+- SPY trend filter → reduced returns
+
+### Conclusion
+The current edge is concentrated in a profitability + short-term reversal hybrid signal.
+Further improvements will likely require:
+- new data sources, or
+- structurally different strategies
+
+Status: FROZEN

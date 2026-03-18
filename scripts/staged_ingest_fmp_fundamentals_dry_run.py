@@ -12,26 +12,13 @@ from typing import Any
 import pandas as pd
 import requests
 
+from quant_lab.utils.env import get_required_env, load_project_env
 from quant_lab.data.fmp_fundamentals import fetch_fmp_fundamentals_frame
 
 
 def _load_env_key() -> str:
-    key = str(os.getenv("FMP_API_KEY", "")).strip()
-    if key:
-        return key
-    env_path = Path(".env")
-    if env_path.exists():
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == "FMP_API_KEY":
-                key = v.strip().strip("\"'").strip()
-                if key:
-                    return key
-    raise ValueError("FMP_API_KEY not found in environment or .env")
-
+    load_project_env()
+    return get_required_env("FMP_API_KEY")
 
 def _read_cohort(path: Path) -> list[str]:
     if not path.exists():

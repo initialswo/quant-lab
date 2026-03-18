@@ -1,0 +1,297 @@
+#!/usr/bin/env python3
+"""Extended sweep of multi-horizon reversal weights inside the quality sleeve."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from quant_lab.engine.runner import run_backtest
+from quant_lab.research.sweep_metrics import extract_annual_turnover
+
+
+RESULTS_ROOT = Path("results") / "quality_multi_horizon_extended_sweep"
+DEFAULT_START = "2010-01-01"
+DEFAULT_END = "2024-12-31"
+DEFAULT_UNIVERSE = "liquid_us"
+DEFAULT_REBALANCE = "weekly"
+DEFAULT_COSTS_BPS = 10.0
+DEFAULT_TOP_N = 75
+DEFAULT_MAX_TICKERS = 2000
+DEFAULT_FUNDAMENTALS_PATH = "data/fundamentals/fundamentals_fmp.parquet"
+DATA_SOURCE = "parquet"
+DATA_CACHE_DIR = "data/equities"
+FACTOR_AGGREGATION_METHOD = "linear"
+FACTOR_NAMES = ["gross_profitability", "reversal_1m", "reversal_5d"]
+VARIANTS = [
+    {
+        "strategy_name": "rev1m_010_rev5d_020",
+        "factor_weights": [0.70, 0.10, 0.20],
+    },
+    {
+        "strategy_name": "rev1m_005_rev5d_025",
+        "factor_weights": [0.70, 0.05, 0.25],
+    },
+    {
+        "strategy_name": "rev1m_000_rev5d_030",
+        "factor_weights": [0.70, 0.00, 0.30],
+    },
+    {
+        "strategy_name": "rev1m_005_rev5d_030",
+        "factor_weights": [0.70, 0.05, 0.30],
+    },
+]
+RESULT_COLUMNS = [
+    "Strategy",
+    "profitability_weight",
+    "reversal_1m_weight",
+    "reversal_5d_weight",
+    "CAGR",
+    "Vol",
+    "Sharpe",
+    "MaxDD",
+    "Turnover",
+]
+PRINT_COLUMNS = ["Strategy", "CAGR", "Vol", "Sharpe", "MaxDD", "Turnover"]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--end", default=DEFAULT_END)
+    parser.add_argument("--output_dir", default=str(RESULTS_ROOT))
+    parser.add_argument("--fundamentals-path", default=DEFAULT_FUNDAMENTALS_PATH)
+    parser.add_argument("--max_tickers", type=int, default=DEFAULT_MAX_TICKERS)
+    return parser.parse_args()
+
+
+
+def _run_config(args: argparse.Namespace, variant: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "start": str(args.start),
+        "end": str(args.end),
+        "universe": DEFAULT_UNIVERSE,
+        "universe_mode": "dynamic",
+        "top_n": DEFAULT_TOP_N,
+        "rebalance": DEFAULT_REBALANCE,
+        "weighting": "inv_vol",
+        "costs_bps": float(DEFAULT_COSTS_BPS),
+        "max_tickers": int(args.max_tickers),
+        "data_source": DATA_SOURCE,
+        "data_cache_dir": DATA_CACHE_DIR,
+        "factor_name": list(FACTOR_NAMES),
+        "factor_names": list(FACTOR_NAMES),
+        "factor_weights": list(variant["factor_weights"]),
+        "portfolio_mode": "composite",
+        "factor_aggregation_method": FACTOR_AGGREGATION_METHOD,
+        "use_factor_normalization": True,
+        "use_sector_neutralization": False,
+        "use_size_neutralization": False,
+        "orthogonalize_factors": False,
+        "fundamentals_path": str(args.fundamentals_path),
+        "save_artifacts": True,
+    }
+
+
+
+def _to_serializable(obj: Any) -> Any:
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, pd.DataFrame):
+        return {
+            "type": "DataFrame",
+            "shape": [int(obj.shape[0]), int(obj.shape[1])],
+            "columns_sample": [str(c) for c in list(obj.columns[:5])],
+        }
+    if isinstance(obj, pd.Series):
+        return {"type": "Series", "length": int(obj.shape[0]), "name": str(obj.name)}
+    if isinstance(obj, dict):
+        return {str(k): _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(x) for x in obj]
+    try:
+        json.dumps(obj)
+        return obj
+    except TypeError:
+        return str(obj)
+
+
+
+def _format_float(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{float(x):.4f}"
+
+
+
+def _copy_latest(files: dict[str, Path], latest_root: Path) -> None:
+    latest_root.mkdir(parents=True, exist_ok=True)
+    for name, src in files.items():
+        shutil.copy2(src, latest_root / name)
+
+
+
+def _print_summary(summary_df: pd.DataFrame) -> None:
+    print("")
+    print("QUALITY MULTI-HORIZON EXTENDED SWEEP")
+    print("------------------------------------")
+    print(
+        f"{'Strategy':20s} {'CAGR':>8s} {'Vol':>8s} {'Sharpe':>8s} {'MaxDD':>8s} {'Turnover':>10s}"
+    )
+    for _, row in summary_df.iterrows():
+        print(
+            f"{str(row['Strategy']):20s} "
+            f"{_format_float(float(row['CAGR'])):>8s} "
+            f"{_format_float(float(row['Vol'])):>8s} "
+            f"{_format_float(float(row['Sharpe'])):>8s} "
+            f"{_format_float(float(row['MaxDD'])):>8s} "
+            f"{_format_float(float(row['Turnover'])):>10s}"
+        )
+
+
+
+def main() -> None:
+    args = _parse_args()
+    base_output_dir = Path(str(args.output_dir))
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = base_output_dir / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    print("QUALITY MULTI-HORIZON EXTENDED SWEEP")
+    print("------------------------------------")
+    print(
+        "Shared config: "
+        f"universe={DEFAULT_UNIVERSE} universe_mode=dynamic rebalance={DEFAULT_REBALANCE} "
+        f"top_n={DEFAULT_TOP_N} weighting=inv_vol costs_bps={DEFAULT_COSTS_BPS} "
+        f"factor_aggregation_method={FACTOR_AGGREGATION_METHOD}"
+    )
+    print("Variants:")
+    for variant in VARIANTS:
+        w0, w1, w2 = (float(x) for x in variant["factor_weights"])
+        print(
+            f"- {variant['strategy_name']}: gross_profitability={w0:.2f}, "
+            f"reversal_1m={w1:.2f}, reversal_5d={w2:.2f}"
+        )
+
+    t0 = time.perf_counter()
+    run_cache: dict[str, Any] = {}
+    rows: list[dict[str, Any]] = []
+    run_manifest: list[dict[str, Any]] = []
+
+    for variant in VARIANTS:
+        cfg = _run_config(args=args, variant=variant)
+        summary, run_outdir = run_backtest(**cfg, run_cache=run_cache)
+        rows.append(
+            {
+                "Strategy": str(variant["strategy_name"]),
+                "profitability_weight": float(variant["factor_weights"][0]),
+                "reversal_1m_weight": float(variant["factor_weights"][1]),
+                "reversal_5d_weight": float(variant["factor_weights"][2]),
+                "CAGR": float(summary.get("CAGR", float("nan"))),
+                "Vol": float(summary.get("Vol", float("nan"))),
+                "Sharpe": float(summary.get("Sharpe", float("nan"))),
+                "MaxDD": float(summary.get("MaxDD", float("nan"))),
+                "Turnover": extract_annual_turnover(summary=summary, outdir=run_outdir),
+            }
+        )
+        run_manifest.append(
+            {
+                "strategy_name": str(variant["strategy_name"]),
+                "factor_names": list(FACTOR_NAMES),
+                "factor_weights": list(variant["factor_weights"]),
+                "run_config": _to_serializable(cfg),
+                "backtest_outdir": str(run_outdir),
+                "summary_path": str(Path(run_outdir) / "summary.json"),
+            }
+        )
+
+    results_df = pd.DataFrame(rows, columns=RESULT_COLUMNS).sort_values(
+        by=["Sharpe", "CAGR"], ascending=[False, False], kind="mergesort"
+    ).reset_index(drop=True)
+    summary_df = results_df.loc[:, PRINT_COLUMNS].copy()
+
+    results_path = run_dir / "quality_multi_horizon_extended_sweep_results.csv"
+    summary_path = run_dir / "quality_multi_horizon_extended_sweep_summary.csv"
+    manifest_path = run_dir / "manifest.json"
+
+    results_df.to_csv(results_path, index=False)
+    summary_df.to_csv(summary_path, index=False)
+
+    best_row = results_df.iloc[0].to_dict() if not results_df.empty else {}
+    manifest = {
+        "timestamp": timestamp,
+        "script_name": "scripts/run_quality_multi_horizon_extended_sweep.py",
+        "start": str(args.start),
+        "end": str(args.end),
+        "universe": DEFAULT_UNIVERSE,
+        "universe_mode": "dynamic",
+        "rebalance": DEFAULT_REBALANCE,
+        "top_n": int(DEFAULT_TOP_N),
+        "weighting": "inv_vol",
+        "costs_bps": float(DEFAULT_COSTS_BPS),
+        "factor_names": list(FACTOR_NAMES),
+        "factor_aggregation_method": FACTOR_AGGREGATION_METHOD,
+        "fundamentals_path": str(args.fundamentals_path),
+        "variants": [
+            {
+                "strategy_name": str(v["strategy_name"]),
+                "factor_weights": list(v["factor_weights"]),
+            }
+            for v in VARIANTS
+        ],
+        "output_dir": str(run_dir),
+        "outputs": {
+            "results": str(results_path),
+            "summary": str(summary_path),
+            "manifest": str(manifest_path),
+        },
+        "best_configuration": _to_serializable(best_row),
+        "runtime_seconds": float(time.perf_counter() - t0),
+        "notes": [
+            "This extended sweep keeps gross_profitability fixed at 0.70 and pushes more weight into reversal_5d.",
+            "All variants reuse the same liquid_us dynamic-universe quality sleeve settings.",
+            "All runs use linear factor aggregation so the supplied weights are honored.",
+        ],
+        "runs": _to_serializable(run_manifest),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    latest_root = base_output_dir / "latest"
+    _copy_latest(
+        files={
+            results_path.name: results_path,
+            summary_path.name: summary_path,
+            manifest_path.name: manifest_path,
+        },
+        latest_root=latest_root,
+    )
+
+    _print_summary(summary_df)
+
+    if best_row:
+        print("")
+        print(
+            "Best configuration: "
+            f"{best_row['Strategy']} Sharpe={_format_float(float(best_row['Sharpe']))} "
+            f"CAGR={_format_float(float(best_row['CAGR']))} "
+            f"Vol={_format_float(float(best_row['Vol']))} "
+            f"MaxDD={_format_float(float(best_row['MaxDD']))} "
+            f"Turnover={_format_float(float(best_row['Turnover']))}"
+        )
+    print(f"Saved: {results_path}")
+    print(f"Saved: {summary_path}")
+    print(f"Saved: {manifest_path}")
+    print(f"Latest: {latest_root}")
+
+
+if __name__ == "__main__":
+    main()

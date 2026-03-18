@@ -13,6 +13,7 @@ from quant_lab.data.tiingo_universe import (
     filter_common_equities,
     load_tiingo_api_key,
 )
+from quant_lab.utils.env import load_project_env
 
 
 def main() -> None:
@@ -20,6 +21,8 @@ def main() -> None:
     parser.add_argument("--output", default=str(DEFAULT_TIINGO_US_COMMON_EQUITY_MANIFEST))
     parser.add_argument("--summary-output", default="")
     args = parser.parse_args()
+
+    load_project_env()
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -34,11 +34,10 @@ DEFAULT_MAX_TICKERS = 2000
 DEFAULT_FUNDAMENTALS_PATH = "data/fundamentals/fundamentals_fmp.parquet"
 DATA_CACHE_DIR = "data/equities"
 PRICE_FILL_MODE = "ffill"
-FACTOR_NAMES = ["gross_profitability", "momentum_12_1", "reversal_1m"]
+FACTOR_NAMES = ["gross_profitability", "roa"]
 DISPLAY_NAME_MAP = {
     "gross_profitability": "profitability",
-    "momentum_12_1": "momentum",
-    "reversal_1m": "reversal",
+    "roa": "roa",
 }
 FUNDAMENTALS_FALLBACK_LAG_DAYS = 60
 UNIVERSE_MIN_PRICE = 5.0

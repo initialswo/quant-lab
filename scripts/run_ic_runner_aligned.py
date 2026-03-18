@@ -20,6 +20,7 @@ from quant_lab.engine.runner import (
     _augment_factor_params_with_fundamentals,
     _collect_close_series,
     _collect_numeric_panel,
+    _collect_price_series,
     _factor_required_history_days,
     _load_universe_seed_tickers,
     _prepare_close_panel,
@@ -92,7 +93,7 @@ def _load_price_panels(
     universe: str,
     data_cache_dir: str,
     max_tickers: int,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any]]:
     tickers = _load_universe_seed_tickers(
         universe=str(universe),
         max_tickers=int(max_tickers),
@@ -117,7 +118,19 @@ def _load_price_panels(
             f"missing={len(missing_tickers)} rejected={len(rejected_tickers)}"
         )
     close_raw = pd.concat(close_cols, axis=1, join="outer")
+    adj_close_cols, _, _, _, _ = _collect_price_series(
+        ohlcv_map=ohlcv_map,
+        requested_tickers=used_tickers,
+        field="Adj Close",
+        fallback_field="Close",
+    )
+    adj_close_raw = pd.concat(adj_close_cols, axis=1, join="outer") if adj_close_cols else close_raw.copy()
     close = _prepare_close_panel(close_raw=close_raw, price_fill_mode=PRICE_FILL_MODE).astype(float)
+    adj_close = _prepare_close_panel(close_raw=adj_close_raw, price_fill_mode=PRICE_FILL_MODE).astype(float)
+    adj_close = adj_close.reindex(index=close.index, columns=close.columns).where(
+        adj_close.reindex(index=close.index, columns=close.columns).notna(),
+        close,
+    )
     volume = _collect_numeric_panel(
         ohlcv_map=ohlcv_map,
         requested_tickers=used_tickers,
@@ -126,7 +139,7 @@ def _load_price_panels(
     summary = dict(data_source_summary)
     summary["tickers_requested"] = int(len(tickers))
     summary["tickers_loaded"] = int(close.shape[1])
-    return close, volume, summary
+    return close, adj_close, volume, summary
 
 
 
@@ -295,7 +308,7 @@ def main() -> None:
         outdir = output_dir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    close, volume, data_source_summary = _load_price_panels(
+    close, adj_close, volume, data_source_summary = _load_price_panels(
         start=str(args.start),
         end=str(args.end),
         universe=str(args.universe),
@@ -304,7 +317,7 @@ def main() -> None:
     )
     factor_scores, factor_params_map = _build_factor_scores(
         factor_name=str(args.factor),
-        close=close,
+        close=adj_close,
         fundamentals_path=str(args.fundamentals_path),
     )
     eligibility = _build_liquid_us_eligibility(
@@ -315,11 +328,11 @@ def main() -> None:
     )
     factor_scores = factor_scores.where(eligibility, np.nan)
     rb = rebalance_mask(pd.DatetimeIndex(close.index), str(args.rebalance))
-    forward_returns = compute_forward_returns(close=close, horizon=int(args.horizon))
+    forward_returns = compute_forward_returns(close=adj_close, horizon=int(args.horizon))
 
     report = run_cross_sectional_factor_diagnostics(
         factor_scores=factor_scores,
-        close=close,
+        close=adj_close,
         eligibility_mask=eligibility,
         rebalance=str(args.rebalance),
         quantiles=int(args.quantiles),
@@ -369,11 +382,14 @@ def main() -> None:
             "augment_factor_params_with_fundamentals": True,
             "build_liquid_us_universe": True,
             "runner_style_preprocessing": "robust_preprocess_base -> percentile_rank_cs",
+            "price_panel_for_signals": "adj_close",
+            "price_panel_for_forward_returns": "adj_close",
+            "price_panel_for_liquid_us_eligibility": "close",
         },
         "factor_params_keys": sorted((factor_params_map.get(str(args.factor), {}) or {}).keys()),
         "data_source_summary": data_source_summary,
-        "n_dates": int(len(close.index)),
-        "n_tickers": int(close.shape[1]),
+        "n_dates": int(len(adj_close.index)),
+        "n_tickers": int(adj_close.shape[1]),
         "n_rebalance_dates": int(len(rb_dates)),
         "n_forward_return_observations": int(forward_returns.notna().sum().sum()),
         "median_eligible_names": float(eligibility.loc[rb].sum(axis=1).median()) if bool(rb.any()) else float("nan"),
@@ -409,6 +425,7 @@ def main() -> None:
         )
 
     overall = dict(report.get("ic_summary", {}).get("overall", {}))
+    print("NOTE: IC diagnostics use adjusted prices for signal construction and forward returns; raw close remains the liquid_us eligibility basis to match run_backtest.")
     print("IC SUMMARY")
     print("----------")
     print(f"{'factor':22s} {'mean_ic':>10s} {'ic_ir':>10s} {'hit_rate':>10s}")

@@ -1,0 +1,422 @@
+#!/usr/bin/env python3
+"""Run broad and ranked time-series momentum sleeve experiments."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import shutil
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+import pandas as pd
+
+from quant_lab.data.fetch import fetch_ohlcv_with_summary
+from quant_lab.engine import runner
+from quant_lab.engine.metrics import compute_daily_mark_to_market, compute_metrics
+from quant_lab.research.cross_asset_trend import annual_turnover
+from quant_lab.strategies.topn import build_topn_weights, rebalance_mask
+from quant_lab.universe.liquid_us import build_liquid_us_universe
+
+
+RESULTS_ROOT = Path("results") / "time_series_momentum_ranked_experiment"
+DEFAULT_START = "2010-01-01"
+DEFAULT_END = "2024-12-31"
+DEFAULT_UNIVERSE = "liquid_us"
+DEFAULT_UNIVERSE_MODE = "dynamic"
+DEFAULT_REBALANCE = "weekly"
+DEFAULT_WEIGHTING = "inv_vol"
+DEFAULT_COSTS_BPS = 10.0
+DEFAULT_TOP_N = 75
+DEFAULT_MAX_TICKERS = 2000
+DEFAULT_LOOKBACK = 252
+DEFAULT_VOL_LOOKBACK = 20
+DATA_SOURCE = "parquet"
+DATA_CACHE_DIR = "data/equities"
+RESULT_COLUMNS = ["Strategy", "CAGR", "Vol", "Sharpe", "MaxDD", "Turnover"]
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--start", default=DEFAULT_START)
+    parser.add_argument("--end", default=DEFAULT_END)
+    parser.add_argument("--universe", default=DEFAULT_UNIVERSE)
+    parser.add_argument("--rebalance", choices=["daily", "weekly", "biweekly", "monthly"], default=DEFAULT_REBALANCE)
+    parser.add_argument("--weighting", choices=["equal", "inv_vol"], default=DEFAULT_WEIGHTING)
+    parser.add_argument("--costs_bps", type=float, default=DEFAULT_COSTS_BPS)
+    parser.add_argument("--top_n", type=int, default=DEFAULT_TOP_N)
+    parser.add_argument("--lookback", type=int, default=DEFAULT_LOOKBACK)
+    parser.add_argument("--vol_lookback", type=int, default=DEFAULT_VOL_LOOKBACK)
+    parser.add_argument("--max_tickers", type=int, default=DEFAULT_MAX_TICKERS)
+    parser.add_argument("--output_dir", default=str(RESULTS_ROOT))
+    return parser.parse_args()
+
+
+def _copy_latest(files: dict[str, Path], latest_root: Path) -> None:
+    latest_root.mkdir(parents=True, exist_ok=True)
+    for name, src in files.items():
+        shutil.copy2(src, latest_root / name)
+
+
+def _format_float(x: float) -> str:
+    if pd.isna(x):
+        return "-"
+    return f"{float(x):.4f}"
+
+
+def _to_serializable(obj: Any) -> Any:
+    if isinstance(obj, pd.Timestamp):
+        return obj.isoformat()
+    if isinstance(obj, pd.DataFrame):
+        return {
+            "type": "DataFrame",
+            "shape": [int(obj.shape[0]), int(obj.shape[1])],
+            "columns_sample": [str(c) for c in list(obj.columns[:5])],
+        }
+    if isinstance(obj, pd.Series):
+        return {"type": "Series", "length": int(obj.shape[0]), "name": str(obj.name)}
+    if isinstance(obj, dict):
+        return {str(k): _to_serializable(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [_to_serializable(x) for x in obj]
+    try:
+        json.dumps(obj)
+        return obj
+    except TypeError:
+        return str(obj)
+
+
+def _load_price_panels(
+    args: argparse.Namespace,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, Any], list[str], list[str]]:
+    tickers = runner._load_universe_seed_tickers(
+        universe=str(args.universe),
+        max_tickers=int(args.max_tickers),
+        data_cache_dir=DATA_CACHE_DIR,
+    )
+    ohlcv_map, data_summary = fetch_ohlcv_with_summary(
+        tickers=tickers,
+        start=str(args.start),
+        end=str(args.end),
+        cache_dir=DATA_CACHE_DIR,
+        data_source=DATA_SOURCE,
+        refresh=False,
+        bulk_prepare=False,
+    )
+    adj_cols, used_adj, missing_adj, rejected_adj, _ = runner._collect_price_series(
+        ohlcv_map=ohlcv_map,
+        requested_tickers=tickers,
+        field="Adj Close",
+        fallback_field="Close",
+    )
+    close_cols, used_close, missing_close, rejected_close, _ = runner._collect_close_series(
+        ohlcv_map=ohlcv_map,
+        requested_tickers=tickers,
+    )
+    if not adj_cols or not close_cols:
+        raise ValueError(
+            "No usable price history found for ranked time-series momentum experiment. "
+            f"adj_missing={len(missing_adj)} adj_rejected={len(rejected_adj)} "
+            f"close_missing={len(missing_close)} close_rejected={len(rejected_close)}"
+        )
+
+    adj_close = pd.concat(adj_cols, axis=1, join="outer")
+    close = pd.concat(close_cols, axis=1, join="outer")
+    adj_close = runner._prepare_close_panel(close_raw=adj_close, price_fill_mode="ffill").astype(float)
+    close = runner._prepare_close_panel(close_raw=close, price_fill_mode="ffill").astype(float)
+
+    common = [c for c in close.columns if c in set(adj_close.columns)]
+    if not common:
+        raise ValueError("No overlapping close and adjusted close columns were found.")
+    close = close.loc[:, common]
+    adj_close = adj_close.reindex(index=close.index, columns=common).astype(float)
+    volume = runner._collect_numeric_panel(
+        ohlcv_map=ohlcv_map,
+        requested_tickers=common,
+        field="Volume",
+    ).reindex(index=close.index, columns=common).astype(float)
+    used = sorted(set(used_adj).intersection(set(used_close)))
+    missing = sorted(set(missing_adj).union(set(missing_close)))
+    return close, adj_close, volume, data_summary, used, missing
+
+
+def _inverse_vol_weights(vol_row: pd.Series, selected: list[str]) -> pd.Series:
+    out = pd.Series(0.0, index=vol_row.index, dtype=float)
+    if not selected:
+        return out
+    vol_sel = pd.to_numeric(vol_row.reindex(selected), errors="coerce")
+    valid = vol_sel[(vol_sel > 0.0) & vol_sel.notna()]
+    if valid.empty:
+        out.loc[selected] = 1.0 / float(len(selected))
+        return out
+    inv = 1.0 / valid
+    inv = inv / float(inv.sum())
+    out.loc[inv.index] = inv.to_numpy(dtype=float)
+    return out
+
+
+def _build_broad_positive_weights(
+    strength: pd.DataFrame,
+    eligibility: pd.DataFrame,
+    adj_close: pd.DataFrame,
+    rebalance: str,
+    weighting: str,
+    vol_lookback: int,
+) -> tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
+    strength = strength.astype(float).sort_index()
+    eligibility = eligibility.reindex(index=strength.index, columns=strength.columns).fillna(False).astype(bool)
+    lagged_strength = strength.shift(1)
+    vol = adj_close.astype(float).pct_change().rolling(int(vol_lookback)).std(ddof=0).shift(1)
+    rb = rebalance_mask(pd.DatetimeIndex(strength.index), str(rebalance))
+    rb_dates = pd.DatetimeIndex(strength.index[rb])
+
+    weights = pd.DataFrame(0.0, index=strength.index, columns=strength.columns, dtype=float)
+    selected_counts = pd.Series(0, index=strength.index, dtype=int)
+    current = pd.Series(0.0, index=strength.columns, dtype=float)
+
+    for dt in strength.index:
+        if bool(rb.loc[dt]):
+            row = lagged_strength.loc[dt]
+            allowed = eligibility.loc[dt]
+            picked = row[(row > 0.0) & allowed & row.notna()].index.tolist()
+            nxt = pd.Series(0.0, index=strength.columns, dtype=float)
+            if picked:
+                if str(weighting).lower() == "equal":
+                    nxt.loc[picked] = 1.0 / float(len(picked))
+                elif str(weighting).lower() == "inv_vol":
+                    nxt = _inverse_vol_weights(vol_row=vol.loc[dt], selected=picked)
+                else:
+                    raise ValueError("weighting must be one of: equal, inv_vol")
+            current = nxt
+        weights.loc[dt] = current
+        selected_counts.loc[dt] = int((current > 0.0).sum())
+
+    return weights.astype(float), selected_counts.astype(int), rb_dates
+
+
+def _build_ranked_weights(
+    strength: pd.DataFrame,
+    eligibility: pd.DataFrame,
+    adj_close: pd.DataFrame,
+    top_n: int,
+    rebalance: str,
+    weighting: str,
+    vol_lookback: int,
+) -> tuple[pd.DataFrame, pd.Series, pd.DatetimeIndex]:
+    eligible_positive_strength = strength.where((strength > 0.0) & eligibility)
+    lagged_scores = eligible_positive_strength.shift(1)
+    weights = build_topn_weights(
+        scores=lagged_scores,
+        close=adj_close,
+        top_n=int(top_n),
+        rebalance=str(rebalance),
+        weighting=str(weighting),
+        vol_lookback=int(vol_lookback),
+        score_clip=5.0,
+        score_floor=0.0,
+        max_weight=1.0,
+        sector_cap=0.0,
+        sector_by_ticker=None,
+        sector_neutral=False,
+        rank_buffer=0,
+        volatility_scaled_weights=False,
+    ).astype(float)
+    rb = rebalance_mask(pd.DatetimeIndex(weights.index), str(rebalance))
+    rb_dates = pd.DatetimeIndex(weights.index[rb])
+    selected_counts = (weights > 0.0).sum(axis=1).astype(int)
+    return weights, selected_counts, rb_dates
+
+
+def _run_sleeve(
+    strategy_name: str,
+    weights_rebal: pd.DataFrame,
+    selected_counts: pd.Series,
+    rb_dates: pd.DatetimeIndex,
+    adj_close: pd.DataFrame,
+    costs_bps: float,
+    rebalance: str,
+) -> tuple[dict[str, float | str], pd.DataFrame, pd.DataFrame]:
+    equity, daily_return, weights_daily = compute_daily_mark_to_market(
+        close=adj_close,
+        weights_rebal=weights_rebal,
+        rebalance_dates=rb_dates,
+        costs_bps=float(costs_bps),
+        slippage_bps=0.0,
+    )
+    metrics = compute_metrics(daily_return)
+    turnover = annual_turnover(weights_daily, rebalance=str(rebalance))
+    summary = {
+        "Strategy": strategy_name,
+        "CAGR": float(metrics.get("CAGR", float("nan"))),
+        "Vol": float(metrics.get("Vol", float("nan"))),
+        "Sharpe": float(metrics.get("Sharpe", float("nan"))),
+        "MaxDD": float(metrics.get("MaxDD", float("nan"))),
+        "Turnover": float(turnover),
+    }
+    daily_df = pd.DataFrame(
+        {
+            f"{strategy_name}_equity": equity.astype(float),
+            f"{strategy_name}_daily_return": daily_return.astype(float),
+            f"{strategy_name}_selected_assets": selected_counts.reindex(daily_return.index).fillna(0).astype(int),
+        }
+    )
+    return summary, daily_df, weights_daily.astype(float)
+
+
+def main() -> None:
+    args = _parse_args()
+    base_output_dir = Path(str(args.output_dir))
+    base_output_dir.mkdir(parents=True, exist_ok=True)
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    run_dir = base_output_dir / timestamp
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    broad_name = "time_series_momentum_broad"
+    ranked_name = "time_series_momentum_ranked_top75"
+
+    print("RANKED TIME-SERIES MOMENTUM EXPERIMENT")
+    print("--------------------------------------")
+    print(
+        "Config: "
+        f"universe={args.universe} universe_mode={DEFAULT_UNIVERSE_MODE} rebalance={args.rebalance} "
+        f"weighting={args.weighting} top_n={int(args.top_n)} costs_bps={float(args.costs_bps):.1f} "
+        f"strength=252-day return broad_selection=all eligible names with positive lagged strength "
+        f"ranked_selection=top {int(args.top_n)} eligible names by positive lagged 252-day return"
+    )
+
+    t0 = time.perf_counter()
+    close, adj_close, volume, data_summary, used_tickers, missing_tickers = _load_price_panels(args=args)
+    eligibility = build_liquid_us_universe(
+        prices=close,
+        volumes=volume,
+        min_price=5.0,
+        min_avg_dollar_volume=10_000_000.0,
+        adv_window=20,
+        min_history=252,
+    )
+    strength = adj_close.astype(float).pct_change(int(args.lookback)).astype(float)
+
+    broad_weights, broad_selected, broad_rb_dates = _build_broad_positive_weights(
+        strength=strength,
+        eligibility=eligibility,
+        adj_close=adj_close,
+        rebalance=str(args.rebalance),
+        weighting=str(args.weighting),
+        vol_lookback=int(args.vol_lookback),
+    )
+    ranked_weights, ranked_selected, ranked_rb_dates = _build_ranked_weights(
+        strength=strength,
+        eligibility=eligibility,
+        adj_close=adj_close,
+        top_n=int(args.top_n),
+        rebalance=str(args.rebalance),
+        weighting=str(args.weighting),
+        vol_lookback=int(args.vol_lookback),
+    )
+
+    broad_summary, broad_daily_df, broad_weights_daily = _run_sleeve(
+        strategy_name=broad_name,
+        weights_rebal=broad_weights,
+        selected_counts=broad_selected,
+        rb_dates=broad_rb_dates,
+        adj_close=adj_close,
+        costs_bps=float(args.costs_bps),
+        rebalance=str(args.rebalance),
+    )
+    ranked_summary, ranked_daily_df, ranked_weights_daily = _run_sleeve(
+        strategy_name=ranked_name,
+        weights_rebal=ranked_weights,
+        selected_counts=ranked_selected,
+        rb_dates=ranked_rb_dates,
+        adj_close=adj_close,
+        costs_bps=float(args.costs_bps),
+        rebalance=str(args.rebalance),
+    )
+
+    results_df = pd.DataFrame([broad_summary, ranked_summary], columns=RESULT_COLUMNS)
+    daily_returns_df = broad_daily_df.join(ranked_daily_df, how="outer")
+
+    results_path = run_dir / "comparison_summary.csv"
+    daily_returns_path = run_dir / "daily_returns.csv"
+    broad_weights_path = run_dir / "rebalance_weights_broad.csv"
+    ranked_weights_path = run_dir / "rebalance_weights_ranked.csv"
+    manifest_path = run_dir / "manifest.json"
+
+    results_df.to_csv(results_path, index=False, float_format="%.10g")
+    daily_returns_df.to_csv(daily_returns_path, index_label="date", float_format="%.10g")
+    broad_weights_daily.loc[broad_rb_dates].to_csv(broad_weights_path, index_label="date", float_format="%.10g")
+    ranked_weights_daily.loc[ranked_rb_dates].to_csv(ranked_weights_path, index_label="date", float_format="%.10g")
+
+    manifest = {
+        "timestamp_utc": timestamp,
+        "script_name": "scripts/run_time_series_momentum_ranked_experiment.py",
+        "results_dir": str(run_dir),
+        "runtime_seconds": float(time.perf_counter() - t0),
+        "date_range": {"start": str(args.start), "end": str(args.end)},
+        "config": {
+            "universe": str(args.universe),
+            "universe_mode": DEFAULT_UNIVERSE_MODE,
+            "rebalance": str(args.rebalance),
+            "weighting": str(args.weighting),
+            "costs_bps": float(args.costs_bps),
+            "lookback": int(args.lookback),
+            "vol_lookback": int(args.vol_lookback),
+            "top_n": int(args.top_n),
+            "broad_selection_rule": "Hold all eligible assets with positive lagged 252-day return.",
+            "ranked_selection_rule": "Hold the top_n eligible assets with positive lagged 252-day return, ranked by strength.",
+            "fallback_rule": "Zero exposure when no eligible asset has positive lagged 252-day return.",
+        },
+        "data_summary": _to_serializable(data_summary),
+        "universe_summary": {
+            "tickers_used": int(len(used_tickers)),
+            "missing_tickers": int(len(missing_tickers)),
+            "eligible_median": float(eligibility.sum(axis=1).median()) if not eligibility.empty else float("nan"),
+            "broad_selected_median": float(broad_selected.median()) if not broad_selected.empty else float("nan"),
+            "ranked_selected_median": float(ranked_selected.median()) if not ranked_selected.empty else float("nan"),
+        },
+        "outputs": {
+            "comparison_summary": str(results_path),
+            "daily_returns": str(daily_returns_path),
+            "rebalance_weights_broad": str(broad_weights_path),
+            "rebalance_weights_ranked": str(ranked_weights_path),
+            "manifest": str(manifest_path),
+        },
+        "notes": [
+            "Uses price data only; no new engine or registry logic was added.",
+            "The ranked sleeve reuses the existing Top-N portfolio helper with pre-lagged positive-only 252-day return scores.",
+        ],
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+
+    _copy_latest(
+        files={
+            results_path.name: results_path,
+            daily_returns_path.name: daily_returns_path,
+            broad_weights_path.name: broad_weights_path,
+            ranked_weights_path.name: ranked_weights_path,
+            manifest_path.name: manifest_path,
+        },
+        latest_root=base_output_dir / "latest",
+    )
+
+    print("")
+    print(
+        results_df.to_string(
+            index=False,
+            formatters={col: _format_float for col in ["CAGR", "Vol", "Sharpe", "MaxDD", "Turnover"]},
+        )
+    )
+    print("")
+    print(f"Saved: {results_path}")
+    print(f"Saved: {daily_returns_path}")
+    print(f"Saved: {broad_weights_path}")
+    print(f"Saved: {ranked_weights_path}")
+    print(f"Saved: {manifest_path}")
+    print(f"Latest: {base_output_dir / 'latest'}")
+
+
+if __name__ == "__main__":
+    main()

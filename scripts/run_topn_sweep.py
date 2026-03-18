@@ -26,6 +26,7 @@ DEFAULT_MAX_TICKERS = 2000
 DEFAULT_FUNDAMENTALS_PATH = "data/fundamentals/fundamentals_fmp.parquet"
 DEFAULT_FACTOR = "gross_profitability"
 DEFAULT_FACTOR_WEIGHTS = ""
+DEFAULT_FACTOR_AGGREGATION_METHOD = ""
 DATA_SOURCE = "parquet"
 DATA_CACHE_DIR = "data/equities"
 TOPN_VALUES = [50, 75, 100, 150, 200]
@@ -58,6 +59,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--fundamentals-path", default=DEFAULT_FUNDAMENTALS_PATH)
     parser.add_argument("--factor", default=DEFAULT_FACTOR)
     parser.add_argument("--factor_weights", default=DEFAULT_FACTOR_WEIGHTS)
+    parser.add_argument(
+        "--factor_aggregation_method",
+        choices=["linear", "mean_rank", "geometric_rank"],
+        default=DEFAULT_FACTOR_AGGREGATION_METHOD,
+    )
     parser.add_argument("--output_dir", default="")
     return parser.parse_args()
 
@@ -86,7 +92,32 @@ def _parse_factor_weights(raw: str, factors: list[str]) -> list[float] | None:
 
 
 
-def _run_config(args: argparse.Namespace, top_n: int, factors: list[str], factor_weights: list[float] | None) -> dict[str, Any]:
+def _resolve_factor_aggregation_method(args: argparse.Namespace, factor_weights: list[float] | None) -> str:
+    explicit = str(getattr(args, "factor_aggregation_method", "")).strip().lower()
+    if factor_weights is None:
+        return explicit or "mean_rank"
+    if not explicit:
+        print(
+            "NOTE: supplied factor_weights now force factor_aggregation_method='linear' so weights are honored; "
+            "older mean_rank behavior would have ignored them."
+        )
+        return "linear"
+    if explicit != "linear":
+        raise ValueError(
+            "Supplied factor_weights require --factor_aggregation_method linear; "
+            f"got '{explicit}', which would ignore scalar weights."
+        )
+    return explicit
+
+
+
+def _run_config(
+    args: argparse.Namespace,
+    top_n: int,
+    factors: list[str],
+    factor_weights: list[float] | None,
+    factor_aggregation_method: str,
+) -> dict[str, Any]:
     return {
         "start": str(args.start),
         "end": str(args.end),
@@ -103,7 +134,7 @@ def _run_config(args: argparse.Namespace, top_n: int, factors: list[str], factor
         "factor_names": list(factors),
         "factor_weights": _equal_weights(factors) if factor_weights is None else list(factor_weights),
         "portfolio_mode": "composite",
-        "factor_aggregation_method": "mean_rank",
+        "factor_aggregation_method": str(factor_aggregation_method),
         "use_factor_normalization": True,
         "use_sector_neutralization": False,
         "use_size_neutralization": False,
@@ -200,6 +231,7 @@ def main() -> None:
 
     factors = _parse_factors(str(args.factor))
     parsed_weights = _parse_factor_weights(str(args.factor_weights), factors=factors)
+    factor_aggregation_method = _resolve_factor_aggregation_method(args=args, factor_weights=parsed_weights)
 
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     output_dir = Path(str(args.output_dir)) if str(args.output_dir).strip() else RESULTS_ROOT / timestamp
@@ -214,7 +246,13 @@ def main() -> None:
     print("TOP-N SWEEP")
     print("----------")
     for top_n in TOPN_VALUES:
-        cfg = _run_config(args=args, top_n=int(top_n), factors=factors, factor_weights=parsed_weights)
+        cfg = _run_config(
+            args=args,
+            top_n=int(top_n),
+            factors=factors,
+            factor_weights=parsed_weights,
+            factor_aggregation_method=factor_aggregation_method,
+        )
         summary, run_outdir = run_backtest(**cfg, run_cache=run_cache)
         row = _result_row(summary=summary, outdir=run_outdir, top_n=int(top_n), args=args, factors=factors)
         rows.append(row)
@@ -260,7 +298,7 @@ def main() -> None:
         "factors": list(factors),
         "factor_weights": list(cfg["factor_weights"]) if rows else (_equal_weights(factors) if parsed_weights is None else list(parsed_weights)),
         "top_n_values": list(TOPN_VALUES),
-        "composite_method": "mean_rank",
+        "composite_method": factor_aggregation_method,
         "weighting": "equal",
         "output_dir": str(output_dir),
         "outputs": {
@@ -272,7 +310,7 @@ def main() -> None:
         "notes": [
             "This sweep reuses run_backtest with the liquid_us dynamic-universe path.",
             "Only Top N varies across runs; factor set, preprocessing, weighting, and costs remain fixed.",
-            "Composite aggregation reuses factor_aggregation_method='mean_rank'.",
+            "Supplied factor_weights are honored only through factor_aggregation_method='linear'; the script now auto-selects that path when weights are provided.",
         ],
         "runs": run_manifest,
     }

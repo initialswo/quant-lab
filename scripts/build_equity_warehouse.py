@@ -6,7 +6,9 @@ import argparse
 from datetime import UTC, datetime
 from pathlib import Path
 
+import duckdb
 import pandas as pd
+import pyarrow.parquet as pq
 
 from build_security_master import build_security_master, normalize_symbol
 
@@ -15,6 +17,7 @@ SOURCE_PRECEDENCE = {
     # vendor direct pulls
     "tiingo_phase2a_dryrun": 400,
     "tiingo_phase2b_dryrun": 400,
+    "tiingo_phase3_bulk": 400,
     "tiingo": 350,
     # cached/legacy sources
     "tiingo_cache": 300,
@@ -58,7 +61,133 @@ def _table_audit(
 
 def _source_rank(source: object) -> int:
     key = str(source or "").strip().lower()
+    if key.startswith("tiingo_phase"):
+        return 400
     return int(SOURCE_PRECEDENCE.get(key, 100))
+
+
+def _quote_sql(path: Path) -> str:
+    return str(path).replace("'", "''")
+
+
+def _normalize_symbol_sql_expr(column: str) -> str:
+    raw = f"UPPER(CAST({column} AS VARCHAR))"
+    return f"REPLACE(CASE WHEN {raw} LIKE '%.US' THEN LEFT({raw}, LENGTH({raw}) - 3) ELSE {raw} END, '.', '-')"
+
+
+def _source_rank_sql_expr(column: str) -> str:
+    key = f"LOWER(COALESCE(CAST({column} AS VARCHAR), ''))"
+    return (
+        f"CASE "
+        f"WHEN {key} LIKE 'tiingo_phase%' THEN 400 "
+        f"WHEN {key} = 'tiingo' THEN 350 "
+        f"WHEN {key} = 'tiingo_cache' THEN 300 "
+        f"WHEN {key} = 'stooq_cache' THEN 200 "
+        f"WHEN {key} = 'sector_stooq' THEN 150 "
+        f"WHEN {key} = 'unknown' THEN 10 "
+        f"ELSE 100 END"
+    )
+
+
+def _adj_close_sql_expr(daily_path: Path) -> str:
+    names = set(pq.read_schema(daily_path).names)
+    parts: list[str] = []
+    if 'adj_close' in names:
+        parts.append('TRY_CAST(d.adj_close AS DOUBLE)')
+    if 'adjClose' in names:
+        parts.append('TRY_CAST(d.adjClose AS DOUBLE)')
+    parts.append('TRY_CAST(d.close AS DOUBLE)')
+    return 'COALESCE(' + ', '.join(parts) + ')'
+
+
+def _build_price_versions_checkpoint(
+    daily_path: Path,
+    security_master_path: Path,
+    versions_path: Path,
+    run_id: str,
+    duckdb_memory_limit: str,
+    duckdb_temp_dir: Path | None,
+    duckdb_threads: int,
+) -> tuple[int, int]:
+    canonical_expr = _normalize_symbol_sql_expr('d.ticker')
+    raw_symbol_expr = 'UPPER(CAST(d.ticker AS VARCHAR))'
+    source_rank_expr = _source_rank_sql_expr('d.source')
+    adj_close_expr = _adj_close_sql_expr(daily_path)
+    load_ts = datetime.now(UTC).isoformat()
+    tmp_path = versions_path.with_suffix('.parquet.tmp')
+    if tmp_path.exists():
+        tmp_path.unlink()
+
+    if duckdb_temp_dir is None:
+        duckdb_temp_dir = versions_path.parent / '.duckdb_tmp_prices_versions'
+    duckdb_temp_dir.mkdir(parents=True, exist_ok=True)
+
+    con = duckdb.connect()
+    try:
+        con.execute(f"PRAGMA memory_limit='{duckdb_memory_limit}'")
+        con.execute(f"PRAGMA temp_directory='{_quote_sql(duckdb_temp_dir)}'")
+        con.execute(f"PRAGMA threads={max(int(duckdb_threads), 1)}")
+        unmatched_sql = f"""
+            SELECT COUNT(*)
+            FROM read_parquet('{_quote_sql(daily_path)}') d
+            LEFT JOIN read_parquet('{_quote_sql(security_master_path)}') sm
+                ON {canonical_expr} = sm.canonical_symbol
+            WHERE sm.ticker_id IS NULL
+        """
+        rows_sql = f"""
+            SELECT COUNT(*)
+            FROM read_parquet('{_quote_sql(daily_path)}') d
+            INNER JOIN read_parquet('{_quote_sql(security_master_path)}') sm
+                ON {canonical_expr} = sm.canonical_symbol
+        """
+        unmatched_prices = int(con.execute(unmatched_sql).fetchone()[0])
+        rows_out = int(con.execute(rows_sql).fetchone()[0])
+        copy_sql = f"""
+            COPY (
+                SELECT
+                    date,
+                    ticker_id,
+                    raw_source_symbol,
+                    canonical_symbol,
+                    open,
+                    high,
+                    low,
+                    close,
+                    adj_close,
+                    volume,
+                    source,
+                    source_rank,
+                    load_batch_id,
+                    load_ts
+                FROM (
+                    SELECT
+                        CAST(d.date AS DATE) AS date,
+                        sm.ticker_id AS ticker_id,
+                        {raw_symbol_expr} AS raw_source_symbol,
+                        {canonical_expr} AS canonical_symbol,
+                        TRY_CAST(d.open AS DOUBLE) AS open,
+                        TRY_CAST(d.high AS DOUBLE) AS high,
+                        TRY_CAST(d.low AS DOUBLE) AS low,
+                        TRY_CAST(d.close AS DOUBLE) AS close,
+                        {adj_close_expr} AS adj_close,
+                        TRY_CAST(d.volume AS DOUBLE) AS volume,
+                        CAST(d.source AS VARCHAR) AS source,
+                        {source_rank_expr} AS source_rank,
+                        '{run_id}' AS load_batch_id,
+                        '{load_ts}' AS load_ts,
+                        RIGHT({raw_symbol_expr}, 3) = '.US' AS _has_us_suffix
+                    FROM read_parquet('{_quote_sql(daily_path)}') d
+                    INNER JOIN read_parquet('{_quote_sql(security_master_path)}') sm
+                        ON {canonical_expr} = sm.canonical_symbol
+                ) ranked
+                ORDER BY date, ticker_id, source_rank DESC, _has_us_suffix ASC, raw_source_symbol ASC, load_ts DESC
+            ) TO '{_quote_sql(tmp_path)}' (FORMAT PARQUET, CODEC 'ZSTD')
+        """
+        con.execute(copy_sql)
+    finally:
+        con.close()
+    tmp_path.replace(versions_path)
+    return rows_out, unmatched_prices
 
 
 def _build_symbol_history(
@@ -124,6 +253,28 @@ def main() -> None:
     p.add_argument("--fundamentals-path", default="data/fundamentals/fundamentals_fmp.parquet")
     p.add_argument("--warehouse-root", default="data/warehouse")
     p.add_argument("--existing-security-master-path", default="")
+    p.add_argument(
+        "--stop-after",
+        choices=["all", "prices_versions"],
+        default="all",
+        help="Optional checkpoint for staged/resumable warehouse builds.",
+    )
+    p.add_argument(
+        "--duckdb-memory-limit",
+        default="1GB",
+        help="DuckDB memory limit for low-memory checkpoint builds.",
+    )
+    p.add_argument(
+        "--duckdb-temp-dir",
+        default="",
+        help="Optional DuckDB temp spill directory for checkpoint builds.",
+    )
+    p.add_argument(
+        "--duckdb-threads",
+        type=int,
+        default=4,
+        help="DuckDB thread count for checkpoint builds.",
+    )
     args = p.parse_args()
 
     equities_root = Path(args.equities_root)
@@ -152,6 +303,26 @@ def main() -> None:
     daily_path = equities_root / "daily_ohlcv.parquet"
     membership_path = equities_root / "universe_membership.parquet"
 
+    if str(args.stop_after).strip().lower() == "prices_versions":
+        versions_path = warehouse_root / "equity_prices_daily_versions.parquet"
+        price_versions_rows, unmatched_prices = _build_price_versions_checkpoint(
+            daily_path=daily_path,
+            security_master_path=warehouse_root / "security_master.parquet",
+            versions_path=versions_path,
+            run_id=run_id,
+            duckdb_memory_limit=str(args.duckdb_memory_limit).strip() or "1GB",
+            duckdb_temp_dir=(
+                Path(args.duckdb_temp_dir)
+                if str(args.duckdb_temp_dir).strip()
+                else None
+            ),
+            duckdb_threads=args.duckdb_threads,
+        )
+        print(f"saved: {warehouse_root / 'security_master.parquet'} rows={len(security_master)}")
+        print(f"saved: {warehouse_root / 'equity_prices_daily_versions.parquet'} rows={price_versions_rows}")
+        print("checkpoint reached: stop_after=prices_versions")
+        return
+
     daily = pd.read_parquet(daily_path)
     daily["raw_source_symbol"] = daily["ticker"].astype(str).str.strip().str.upper()
     daily["canonical_symbol"] = daily["raw_source_symbol"].map(normalize_symbol)
@@ -159,7 +330,17 @@ def main() -> None:
     unmatched_prices = int(daily["ticker_id"].isna().sum())
     price_versions = daily.loc[daily["ticker_id"].notna()].copy()
     price_versions["date"] = pd.to_datetime(price_versions["date"], errors="coerce").dt.normalize()
-    price_versions["adj_close"] = pd.to_numeric(price_versions["close"], errors="coerce")
+    price_versions["close"] = pd.to_numeric(price_versions["close"], errors="coerce")
+    if "adj_close" in price_versions.columns:
+        price_versions["adj_close"] = pd.to_numeric(price_versions["adj_close"], errors="coerce")
+    elif "adjClose" in price_versions.columns:
+        price_versions["adj_close"] = pd.to_numeric(price_versions["adjClose"], errors="coerce")
+    else:
+        price_versions["adj_close"] = pd.NA
+    price_versions["adj_close"] = price_versions["adj_close"].where(
+        price_versions["adj_close"].notna(),
+        price_versions["close"],
+    )
     price_versions["source_rank"] = price_versions["source"].map(_source_rank).astype(int)
     price_versions["_has_us_suffix"] = price_versions["raw_source_symbol"].astype(str).str.endswith(".US")
     price_versions["load_batch_id"] = run_id

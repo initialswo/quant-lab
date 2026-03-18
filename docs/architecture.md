@@ -138,7 +138,9 @@ Phase 3 operational flow:
 - bulk vendor pulls are staged under `data/staging/phase3/<timestamp>/raw/`
 - staged source snapshots are assembled under `data/staging/phase3/<timestamp>/source/`
 - warehouse build + strict validation run on staged inputs
-- only validated outputs are promoted into canonical `data/warehouse/`
+- security master metadata completeness is audited separately from price-layer promotion readiness
+- validated price + identity outputs are promoted into canonical `data/warehouse/` even if `sector` / `industry` coverage remains incomplete
+- classification-dependent research remains guarded until classification coverage improves
 - pre-promotion warehouse snapshots are backed up under `results/ingest/phase3/backups/<timestamp>/`
 
 ## Causality / Lookahead Controls

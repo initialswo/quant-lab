@@ -102,3 +102,34 @@ def test_empty_payload_graceful() -> None:
     )
     assert out.empty
     assert list(out.columns) == INTERNAL_COLUMNS
+
+
+def test_available_date_never_precedes_period_end() -> None:
+    income = [
+        {
+            "date": "2024-12-31",
+            "revenue": 1000,
+            "costOfRevenue": 600,
+            "grossProfit": 400,
+            "netIncome": 120,
+            "weightedAverageShsOutDil": 55.0,
+            "filingDate": "2024-12-15",
+        },
+    ]
+    balance = [
+        {
+            "date": "2024-12-31",
+            "totalAssets": 5000,
+            "totalStockholdersEquity": 2100,
+        },
+    ]
+    out = parse_fmp_statements_payload(
+        ticker="AAPL",
+        income_payload=income,
+        balance_payload=balance,
+        available_lag_days=60,
+    )
+    row = out.iloc[0]
+    assert row["period_end"] == pd.Timestamp("2024-12-31")
+    assert row["available_date"] == pd.Timestamp("2024-12-31")
+    assert int(out.attrs.get("available_date_floor_corrections", 0)) == 1

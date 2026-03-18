@@ -32,6 +32,49 @@ def _safe_examples(series: pd.Series, k: int = 10) -> str:
     return ";".join(vals)
 
 
+def _security_master_metadata_completeness(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for column in ['name', 'exchange', 'sector', 'industry']:
+        null_count = int(df[column].isna().sum()) if column in df.columns else int(len(df))
+        rows.append(
+            {
+                'column': column,
+                'row_count': int(len(df)),
+                'null_count': null_count,
+                'non_null_count': int(len(df) - null_count),
+                'null_frac': float(null_count / max(1, len(df))),
+                'sample_values': _safe_examples(df[column], k=10) if column in df.columns else '',
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _reporting_delay_audit(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    if df.empty:
+        return pd.DataFrame([{
+            "row_count": 0,
+            "negative_reporting_delay_rows": 0,
+            "min_reporting_delay_days": 0.0,
+            "sample_negative_rows": "",
+        }]), 0
+
+    period_end = pd.to_datetime(df.get("period_end"), errors="coerce")
+    available_date = pd.to_datetime(df.get("available_date"), errors="coerce")
+    delay_days = (available_date - period_end).dt.days
+    bad_mask = period_end.notna() & available_date.notna() & (delay_days < 0)
+    sample = ""
+    if bool(bad_mask.any()):
+        sample_rows = df.loc[bad_mask, [c for c in ["ticker_id", "canonical_symbol", "raw_source_symbol", "period_end", "available_date"] if c in df.columns]].head(10)
+        sample = sample_rows.astype(str).agg("|".join, axis=1).str.cat(sep=';')
+    audit = pd.DataFrame([{
+        "row_count": int(len(df)),
+        "negative_reporting_delay_rows": int(bad_mask.sum()),
+        "min_reporting_delay_days": float(delay_days.min()) if delay_days.notna().any() else 0.0,
+        "sample_negative_rows": sample,
+    }])
+    return audit, int(bad_mask.sum())
+
+
 def _parse_null_thresholds(raw: str) -> dict[str, float]:
     out: dict[str, float] = {}
     txt = str(raw or "").strip()
@@ -183,6 +226,12 @@ def main() -> None:
     )
     symbol_history_cov.to_csv(out_dir / "symbol_history_coverage.csv", index=False)
 
+    security_meta_completeness = _security_master_metadata_completeness(security)
+    security_meta_completeness.to_csv(out_dir / "security_master_metadata_completeness.csv", index=False)
+
+    reporting_delay_audit, negative_reporting_delay_rows = _reporting_delay_audit(fundamentals)
+    reporting_delay_audit.to_csv(out_dir / "fundamentals_reporting_delay_audit.csv", index=False)
+
     null_profile = {
         "security_master": _null_profile(security),
         "equity_prices_daily": _null_profile(prices),
@@ -221,6 +270,16 @@ def main() -> None:
         "duplicates": {
             row["table_name"]: int(row["duplicate_rows"]) for row in dup_rows
         },
+        "security_master_metadata_completeness": {
+            row['column']: {
+                'null_count': int(row['null_count']),
+                'non_null_count': int(row['non_null_count']),
+                'null_frac': float(row['null_frac']),
+                'sample_values': row['sample_values'],
+            }
+            for row in security_meta_completeness.to_dict(orient='records')
+        },
+        "fundamentals_reporting_delay": reporting_delay_audit.to_dict(orient='records')[0],
         "symbol_match": {
             row["table_name"]: {
                 "matched": int(row["matched_symbols"]),
@@ -237,6 +296,8 @@ def main() -> None:
             "ticker_id_stability_report": str(out_dir / "ticker_id_stability_report.csv"),
             "symbol_collision_report": str(out_dir / "symbol_collision_report.csv"),
             "symbol_history_coverage": str(out_dir / "symbol_history_coverage.csv"),
+            "security_master_metadata_completeness": str(out_dir / "security_master_metadata_completeness.csv"),
+            "fundamentals_reporting_delay_audit": str(out_dir / "fundamentals_reporting_delay_audit.csv"),
             "null_profile": str(out_dir / "null_profile.json"),
             "validation_summary": str(out_dir / "validation_summary.json"),
         },
@@ -339,12 +400,14 @@ def main() -> None:
         "unmatched_symbols_breach": total_unmatched_symbols > int(args.max_unmatched_symbols),
         "critical_nulls_breach": critical_null_failures > 0,
         "ticker_id_instability_breach": ticker_id_instability > int(args.max_ticker_id_instability),
+        "negative_reporting_delay_breach": negative_reporting_delay_rows > 0,
     }
     threshold_status = {
         "total_duplicate_rows": total_duplicate_rows,
         "total_unmatched_symbols": total_unmatched_symbols,
         "ticker_id_instability_count": ticker_id_instability,
         "critical_null_failures": critical_null_failures,
+        "negative_reporting_delay_rows": negative_reporting_delay_rows,
         "critical_null_checks": critical_null_checks,
         "breaches": breaches,
         "failed": bool(any(breaches.values())),
@@ -363,6 +426,8 @@ def main() -> None:
         "ticker_id_stability_report.csv",
         "symbol_collision_report.csv",
         "symbol_history_coverage.csv",
+        "security_master_metadata_completeness.csv",
+        "fundamentals_reporting_delay_audit.csv",
         "validation_thresholds.json",
         "null_profile.json",
         "validation_summary.json",

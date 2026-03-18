@@ -20,6 +20,10 @@ SRC = ROOT / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
+from quant_lab.utils.env import load_project_env
+
+load_project_env()
+
 from quant_lab.data.fetch import fetch_ohlcv_with_summary
 from quant_lab.data.historical_membership import load_historical_membership
 from quant_lab.data.ingest import ingest_equity_cache, ingest_universe_membership_csv

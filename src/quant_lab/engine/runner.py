@@ -323,7 +323,7 @@ def _augment_factor_params_with_fundamentals(
     fundamentals_fallback_lag_days: int,
 ) -> dict[str, dict]:
     """Inject PIT-aligned fundamentals panels for fundamentals-dependent factors."""
-    fundamentals_factors = {"gross_profitability", "earnings_yield", "roa"}
+    fundamentals_factors = {"gross_profitability", "earnings_yield", "roa", "asset_turnover", "book_to_market"}
     needed = set(factor_names).intersection(fundamentals_factors)
     if not needed:
         return {k: dict(v) for k, v in factor_params_map.items()}
@@ -470,7 +470,7 @@ def _prepare_close_panel(close_raw: pd.DataFrame, price_fill_mode: str) -> pd.Da
     mode = str(price_fill_mode).lower()
     close = close_raw.astype(float).sort_index()
     if mode == "ffill":
-        close = close.ffill().bfill()
+        close = close.ffill()
     elif mode == "none":
         close = close.loc[close.notna().any(axis=1)]
     else:
@@ -1063,7 +1063,7 @@ def _get_benchmark_close_from_map(
     col = "Adj Close" if "Adj Close" in bench_df.columns else "Close"
     if col not in bench_df.columns:
         raise ValueError(f"Benchmark {symbol} frame must contain 'Adj Close' or 'Close'.")
-    bench_close = pd.Series(bench_df[col]).astype(float).reindex(score_index).ffill().bfill()
+    bench_close = pd.Series(bench_df[col]).astype(float).reindex(score_index).ffill()
     if bench_close.isna().all():
         raise ValueError(f"Benchmark {symbol} proxy series is empty after alignment.")
     return bench_close
@@ -2109,7 +2109,9 @@ def run_backtest(
         )
 
     sim = simulate_portfolio(
-        close=close,
+        # Use adjusted prices for PnL so simulation stays aligned with factor inputs
+        # and avoids split-related distortions in the active research runtime.
+        close=adj_close,
         weights=weights,
         costs_bps=costs_bps,
         slippage_bps=slippage_bps,
@@ -3741,7 +3743,9 @@ def run_walkforward(
             )
 
         sim_hist = simulate_portfolio(
-            close=close_hist,
+            # Use adjusted prices for walkforward PnL so simulation stays aligned
+            # with factor inputs and avoids split-related distortions.
+            close=adj_close_hist,
             weights=weights,
             costs_bps=costs_bps,
             slippage_bps=slippage_bps,

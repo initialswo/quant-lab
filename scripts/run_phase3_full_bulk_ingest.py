@@ -11,12 +11,14 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 
+import duckdb
 import pandas as pd
 
 from quant_lab.data.tiingo_universe import (
     DEFAULT_TIINGO_US_COMMON_EQUITY_MANIFEST,
     load_symbol_manifest,
 )
+from quant_lab.utils.env import load_project_env
 
 
 def _norm(raw: object) -> str:
@@ -57,7 +59,6 @@ def _load_ticker_universe(
             if t and t not in seen:
                 seen.add(t)
                 out.append(t)
-    out = sorted(out)
     if int(max_tickers) > 0:
         out = out[: int(max_tickers)]
     return out
@@ -108,11 +109,23 @@ def main() -> None:
     p.add_argument("--staging-root", default="data/staging/phase3")
     p.add_argument("--validation-root", default="results/data_validation")
     p.add_argument("--results-root", default="results/ingest/phase3")
+    p.add_argument("--run-id", default="", help="Optional existing run id/timestamp to resume in-place.")
     p.add_argument("--max-tickers", type=int, default=0, help="Optional cap for emergency partial run.")
+    p.add_argument("--tiingo-batch-size", type=int, default=100)
+    p.add_argument("--tiingo-batch-pause-seconds", type=float, default=0.5)
+    p.add_argument("--tiingo-timeout-seconds", type=float, default=30.0)
+    p.add_argument("--tiingo-max-retries", type=int, default=6)
+    p.add_argument("--tiingo-initial-backoff-seconds", type=float, default=2.0)
+    p.add_argument("--tiingo-backoff-multiplier", type=float, default=2.0)
+    p.add_argument("--tiingo-max-backoff-seconds", type=float, default=120.0)
+    p.add_argument("--tiingo-resume", type=int, choices=[0, 1], default=1)
+    p.add_argument("--duckdb-memory-limit", default="2GB")
+    p.add_argument("--duckdb-threads", type=int, default=4)
     p.add_argument("--promote", type=int, choices=[0, 1], default=1, help="Promote staged warehouse into canonical data/warehouse after validation succeeds.")
     args = p.parse_args()
+    load_project_env()
 
-    ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
+    ts = str(args.run_id).strip() or datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.staging_root) / ts
     raw_root = run_root / "raw"
     source_root = run_root / "source"
@@ -126,6 +139,7 @@ def main() -> None:
     equities_root = Path(args.equities_root)
     fundamentals_path = Path(args.fundamentals_path)
     baseline_warehouse_root = Path(args.warehouse_root)
+    validation_phase_root = Path(args.validation_root) / "phase3"
 
     tickers = _load_ticker_universe(
         equities_root=equities_root,
@@ -182,150 +196,112 @@ def main() -> None:
             "1900-01-01",
             "--source-label",
             "tiingo_phase3_bulk",
+            "--batch-size",
+            str(args.tiingo_batch_size),
+            "--batch-pause-seconds",
+            str(args.tiingo_batch_pause_seconds),
+            "--timeout-seconds",
+            str(args.tiingo_timeout_seconds),
+            "--max-retries",
+            str(args.tiingo_max_retries),
+            "--initial-backoff-seconds",
+            str(args.tiingo_initial_backoff_seconds),
+            "--backoff-multiplier",
+            str(args.tiingo_backoff_multiplier),
+            "--max-backoff-seconds",
+            str(args.tiingo_max_backoff_seconds),
+            "--resume",
+            str(args.tiingo_resume),
         ],
         env=env,
     )
 
-    # Build staged source tables.
-    base_daily = pd.read_parquet(equities_root / "daily_ohlcv.parquet")
-    base_meta = pd.read_parquet(equities_root / "metadata.parquet")
-    base_membership = pd.read_parquet(equities_root / "universe_membership.parquet")
-    base_fund = pd.read_parquet(fundamentals_path)
-    base_selected_prices = pd.read_parquet(baseline_warehouse_root / "equity_prices_daily.parquet")
-
-    tiingo_new = pd.read_parquet(raw_root / "tiingo" / "tiingo_daily_snapshot.parquet")
-    tiingo_append = (
-        tiingo_new.rename(columns={"adjClose": "adj_close"})[
-            ["date", "ticker", "open", "high", "low", "close", "adj_close", "volume", "source"]
-        ].copy()
-        if not tiingo_new.empty
-        else pd.DataFrame(columns=["date", "ticker", "open", "high", "low", "close", "adj_close", "volume", "source"])
-    )
-    merged_daily = pd.concat([base_daily, tiingo_append], ignore_index=True)
-    merged_daily["date"] = _normalize_date_series(merged_daily["date"])
-    merged_daily["ticker"] = merged_daily["ticker"].astype(str).str.upper()
-    merged_daily = merged_daily.dropna(subset=["date"]).sort_values(["date", "ticker"]).reset_index(drop=True)
-
-    fmp_new = pd.read_parquet(raw_root / "fmp" / "fundamentals_fmp_bulk.parquet")
-    fmp_append = (
-        fmp_new[
-            [
-                "ticker",
-                "period_end",
-                "available_date",
-                "revenue",
-                "cogs",
-                "gross_profit",
-                "total_assets",
-                "shareholders_equity",
-                "net_income",
-                "shares_outstanding",
-            ]
-        ].copy()
-        if not fmp_new.empty
-        else pd.DataFrame(columns=base_fund.columns)
-    )
-    merged_fund = pd.concat([base_fund, fmp_append], ignore_index=True)
-    merged_fund["ticker"] = merged_fund["ticker"].astype(str).str.upper().map(_norm)
-    merged_fund["period_end"] = pd.to_datetime(merged_fund["period_end"], errors="coerce").dt.normalize()
-    merged_fund["available_date"] = pd.to_datetime(merged_fund["available_date"], errors="coerce").dt.normalize()
-    merged_fund = (
-        merged_fund.dropna(subset=["ticker", "period_end", "available_date"])
-        .drop_duplicates(subset=["ticker", "period_end", "available_date"], keep="last")
-        .sort_values(["ticker", "available_date", "period_end"])
-        .reset_index(drop=True)
-    )
-
-    merged_meta = _enrich_metadata(base_metadata=base_meta, tiingo_snapshot=tiingo_new)
-
-    base_daily.to_parquet(run_root / "baseline_daily.parquet", index=False)
-    base_fund.to_parquet(run_root / "baseline_fundamentals.parquet", index=False)
-    merged_daily.to_parquet(staged_equities / "daily_ohlcv.parquet", index=False)
-    merged_meta.to_parquet(staged_equities / "metadata.parquet", index=False)
-    base_membership.to_parquet(staged_equities / "universe_membership.parquet", index=False)
-    merged_fund.to_parquet(staged_fundamentals / "fundamentals_fmp.parquet", index=False)
-
-    # Build warehouse and validate strict.
     _run(
         [
             sys.executable,
-            "scripts/build_equity_warehouse.py",
+            "scripts/continue_phase3_bulk_ingest_from_raw.py",
+            "--run-root",
+            str(run_root),
             "--equities-root",
-            str(staged_equities),
+            str(equities_root),
             "--fundamentals-path",
-            str(staged_fundamentals / "fundamentals_fmp.parquet"),
+            str(fundamentals_path),
             "--warehouse-root",
-            str(staged_warehouse),
-            "--existing-security-master-path",
-            str(baseline_warehouse_root / "security_master.parquet"),
-        ],
-        env=env,
-    )
-    _run(
-        [
-            sys.executable,
-            "scripts/validate_equity_warehouse.py",
-            "--warehouse-root",
-            str(staged_warehouse),
-            "--out-root",
-            str(Path(args.validation_root) / "phase3"),
-            "--max-duplicate-rows",
-            "0",
-            "--max-unmatched-symbols",
-            "0",
-            "--max-critical-null-frac",
-            "0",
-            "--max-ticker-id-instability",
-            "0",
+            str(baseline_warehouse_root),
+            "--validation-root",
+            str(validation_phase_root),
+            "--duckdb-memory-limit",
+            str(args.duckdb_memory_limit),
+            "--duckdb-threads",
+            str(args.duckdb_threads),
         ],
         env=env,
     )
 
     # Collect summary metrics.
     tiingo_report = pd.read_csv(raw_root / "tiingo" / "tiingo_fetch_report.csv")
-    fmp_report = pd.DataFrame()
-    if (raw_root / "fmp" / "fundamentals_fmp_bulk.parquet").exists():
-        # Build per-ticker success proxy from output rows (no separate report in build_fundamentals_database.py).
-        fmp_out = pd.read_parquet(raw_root / "fmp" / "fundamentals_fmp_bulk.parquet")
-        fmp_report = fmp_out.groupby("ticker").size().rename("rows").reset_index().rename(columns={"ticker": "ticker"})
-    staged_selected = pd.read_parquet(staged_warehouse / "equity_prices_daily.parquet")
-    staged_versions = pd.read_parquet(staged_warehouse / "equity_prices_daily_versions.parquet")
-    staged_fund_out = pd.read_parquet(staged_warehouse / "equity_fundamentals_pit.parquet")
     stability = pd.read_parquet(staged_warehouse / "ticker_id_stability_report.parquet")
+    staged_selected_path = staged_warehouse / "equity_prices_daily.parquet"
+    staged_fund_path = staged_warehouse / "equity_fundamentals_pit.parquet"
+    base_selected_path = baseline_warehouse_root / "equity_prices_daily.parquet"
+    base_daily_path = equities_root / "daily_ohlcv.parquet"
+    base_fund_path = fundamentals_path
+    raw_fmp_path = raw_root / "fmp" / "fundamentals_fmp_bulk.parquet"
 
-    base_keys = base_selected_prices[["date", "ticker_id"]].copy()
-    base_keys["date"] = pd.to_datetime(base_keys["date"], errors="coerce").dt.normalize()
-    base_keys["key"] = base_keys["date"].astype(str) + "|" + base_keys["ticker_id"].astype(str)
-    staged_keys = staged_selected[["date", "ticker_id"]].copy()
-    staged_keys["date"] = pd.to_datetime(staged_keys["date"], errors="coerce").dt.normalize()
-    staged_keys["key"] = staged_keys["date"].astype(str) + "|" + staged_keys["ticker_id"].astype(str)
-    base_key_set = set(base_keys["key"].astype(str))
-    staged_key_set = set(staged_keys["key"].astype(str))
-    new_price_rows_added = int(len(staged_key_set - base_key_set))
-
-    base_src = base_selected_prices[["date", "ticker_id", "source"]].copy()
-    base_src["date"] = pd.to_datetime(base_src["date"], errors="coerce").dt.normalize()
-    cmp = staged_selected[["date", "ticker_id", "source"]].merge(
-        base_src.rename(columns={"source": "base_source"}),
-        on=["date", "ticker_id"],
-        how="left",
-    )
-    replaced_by_precedence = int(
-        (cmp["base_source"].notna() & (cmp["base_source"].astype(str) != cmp["source"].astype(str))).sum()
-    )
-
-    base_fund_rows = int(len(base_fund))
-    new_fund_rows_added = int(len(staged_fund_out) - base_fund_rows)
-
-    base_symbols = set(base_daily["ticker"].map(_norm).dropna().astype(str))
-    final_symbols = set(staged_selected["canonical_symbol"].astype(str))
-    new_symbols_seen = int(len(final_symbols - base_symbols))
+    con = duckdb.connect()
+    try:
+        con.execute(f"PRAGMA threads={max(int(args.duckdb_threads), 1)}")
+        norm_expr = "REPLACE(CASE WHEN UPPER(CAST(ticker AS VARCHAR)) LIKE '%.US' THEN LEFT(UPPER(CAST(ticker AS VARCHAR)), LENGTH(UPPER(CAST(ticker AS VARCHAR))) - 3) ELSE UPPER(CAST(ticker AS VARCHAR)) END, '.', '-')"
+        new_price_rows_added = int(con.execute(
+            f"""
+            SELECT COUNT(*)
+            FROM (
+                SELECT date, ticker_id FROM read_parquet('{staged_selected_path}')
+                EXCEPT
+                SELECT CAST(date AS DATE) AS date, ticker_id FROM read_parquet('{base_selected_path}')
+            )
+            """
+        ).fetchone()[0])
+        replaced_by_precedence = int(con.execute(
+            f"""
+            WITH base_src AS (
+                SELECT CAST(date AS DATE) AS date, ticker_id, CAST(source AS VARCHAR) AS base_source
+                FROM read_parquet('{base_selected_path}')
+            )
+            SELECT COUNT(*)
+            FROM read_parquet('{staged_selected_path}') s
+            JOIN base_src b USING (date, ticker_id)
+            WHERE COALESCE(CAST(s.source AS VARCHAR), '') != COALESCE(b.base_source, '')
+            """
+        ).fetchone()[0])
+        base_fund_rows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{base_fund_path}')").fetchone()[0])
+        staged_fund_rows = int(con.execute(f"SELECT COUNT(*) FROM read_parquet('{staged_fund_path}')").fetchone()[0])
+        new_fund_rows_added = int(staged_fund_rows - base_fund_rows)
+        new_symbols_seen = int(con.execute(
+            f"""
+            WITH base_symbols AS (
+                SELECT DISTINCT {norm_expr} AS sym
+                FROM read_parquet('{base_daily_path}')
+            ), final_symbols AS (
+                SELECT DISTINCT CAST(canonical_symbol AS VARCHAR) AS sym
+                FROM read_parquet('{staged_selected_path}')
+            )
+            SELECT COUNT(*)
+            FROM final_symbols
+            WHERE sym NOT IN (SELECT sym FROM base_symbols)
+            """
+        ).fetchone()[0])
+        fmp_succeeded_tickers = int(
+            con.execute(f"SELECT COUNT(DISTINCT UPPER(CAST(ticker AS VARCHAR))) FROM read_parquet('{raw_fmp_path}')").fetchone()[0]
+        ) if raw_fmp_path.exists() else 0
+    finally:
+        con.close()
 
     ticker_id_reused = int(stability["status"].eq("reused").sum())
     ticker_id_new = int(stability["status"].eq("new").sum())
     ticker_id_changed = int(stability["status"].eq("changed").sum())
 
-    val_summary_path = Path(args.validation_root) / "phase3" / "latest" / "validation_summary.json"
+    val_summary_path = validation_phase_root / "latest" / "validation_summary.json"
     val = json.loads(val_summary_path.read_text(encoding="utf-8"))
     cov = val.get("coverage", {})
 
@@ -333,7 +309,7 @@ def main() -> None:
         "run_root": str(run_root),
         "requested_tickers": int(len(tickers)),
         "tiingo_succeeded_tickers": int((tiingo_report["rows"] > 0).sum()) if not tiingo_report.empty else 0,
-        "fmp_succeeded_tickers": int(fmp_report["ticker"].nunique()) if not fmp_report.empty else 0,
+        "fmp_succeeded_tickers": int(fmp_succeeded_tickers),
         "new_price_rows_added": new_price_rows_added,
         "price_rows_replaced_by_precedence": replaced_by_precedence,
         "new_fundamentals_rows_added": new_fund_rows_added,

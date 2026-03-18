@@ -42,6 +42,9 @@ See `scripts/` for experiment runners and `src/quant_lab/research/` for reusable
 4. Run benchmark/combo scripts for sleeve interaction analysis.
 5. Promote or reject variants based on robustness and diversification behavior.
 
+## Environment
+API-using scripts now auto-load the repo-root `.env` via `python-dotenv`, so `TIINGO_API_KEY` and `FMP_API_KEY` are available even when commands are launched from a different working directory.
+
 ## Design Intent
 - Keep strategy logic explicit and testable.
 - Preserve causal/lag-safe mechanics.

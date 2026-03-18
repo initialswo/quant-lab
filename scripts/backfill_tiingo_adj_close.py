@@ -13,6 +13,8 @@ from typing import Any
 import pandas as pd
 import requests
 
+from quant_lab.utils.env import get_required_env, load_project_env
+
 TIINGO_SOURCES = {"tiingo", "tiingo_cache"}
 BATCH_SIZE = 50
 SLEEP_SECONDS = 1.0
@@ -29,22 +31,8 @@ def _parse_args() -> argparse.Namespace:
 
 
 def _load_env_key() -> str:
-    key = str(os.getenv("TIINGO_API_KEY", "")).strip()
-    if key:
-        return key
-    env_path = Path(".env")
-    if env_path.exists():
-        for raw in env_path.read_text(encoding="utf-8").splitlines():
-            line = raw.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            k, v = line.split("=", 1)
-            if k.strip() == "TIINGO_API_KEY":
-                out = v.strip().strip("\"'").strip()
-                if out:
-                    return out
-    raise ValueError("TIINGO_API_KEY not found in environment or .env")
-
+    load_project_env()
+    return get_required_env("TIINGO_API_KEY")
 
 def _to_vendor_symbol(store_ticker: str) -> str:
     symbol = str(store_ticker).strip().upper()

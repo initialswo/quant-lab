@@ -4,11 +4,11 @@ This document provides minimal onboarding context for AI agents assisting with t
 
 For full documentation see:
 
-docs/project_brief.md
-docs/research_state.md
-docs/research_principles.md
-docs/research_roadmap.md
-docs/experiment_log.md
+`docs/project_brief.md`  
+`docs/research_state.md`  
+`docs/research_principles.md`  
+`docs/research_roadmap.md`  
+`docs/experiment_log.md`
 
 ---
 
@@ -22,31 +22,33 @@ Primary research areas:
 * portfolio construction
 * multi-strategy portfolio design
 
-The system supports:
-
-* bias-safe backtesting
-* factor experimentation
-* strategy combination analysis
-* reproducible research workflows
-
 ---
 
-# Current Dataset
+# Current Data Readiness
 
-All experiments run on a validated warehouse dataset located in:
+Canonical warehouse location:
 
-data/warehouse/
+`data/warehouse/`
 
-Dataset properties:
+Current promotion-ready staged candidate:
 
-* ~2,528 US equities
-* ~9.48M daily price rows
-* price history: 1962–2026
-* ~94.7% fundamental coverage
+`data/staging/phase3_tiingo_manifest/20260315_phase3_tiingo_priority_overlay1/warehouse/`
+
+Readiness split:
+
+* canonical price layer: ready
+* security identity layer: ready
+* security classification layer: incomplete
+
+Interpretation:
+
+* Price and identity are sufficient for canonical warehouse promotion.
+* Incomplete `sector` / `industry` coverage in `security_master` is a metadata-quality issue, not a price-promotion blocker.
+* Classification-dependent research should remain guarded until coverage improves.
 
 Primary vendors:
 
-* Tiingo — equity prices
+* Tiingo — equity prices and security metadata
 * FMP — fundamentals
 
 Key integrity protections:
@@ -58,7 +60,13 @@ Key integrity protections:
 
 See:
 
-docs/research_state.md
+`docs/research_state.md`
+
+---
+
+# Research Caveat
+
+Sector-neutral and industry-neutral research should remain disabled or explicitly flagged as experimental until `security_master` classification coverage is materially improved.
 
 ---
 
@@ -66,22 +74,10 @@ docs/research_state.md
 
 Factor stack:
 
-momentum_12_1
-reversal_1m
-low_vol_20
-gross_profitability
-
-Baseline configuration:
-
-top_n = 50
-equal weight
-weekly rebalance
-transaction cost = 10 bps
-
-Universes tested:
-
-sp500 (historical membership)
-liquid_us (dynamic liquidity universe)
+`momentum_12_1`  
+`reversal_1m`  
+`low_vol_20`  
+`gross_profitability`
 
 ---
 
@@ -97,30 +93,19 @@ These rules must not be violated:
 
 See:
 
-docs/research_principles.md
+`docs/research_principles.md`
 
 ---
 
 # Current Research Phase
 
-Infrastructure and data ingestion are complete.
+Infrastructure and canonical price-data promotion are ready.
 
-The project is now focused on:
+Open infrastructure task:
 
-* factor robustness analysis
-* portfolio construction research
-* multi-strategy portfolio design
+* improve security classification metadata coverage for `sector` and `industry`
 
-Next experiments include:
-
-* portfolio breadth sensitivity (top_n sweep)
-* factor weight robustness
-* rebalance frequency sensitivity
-* regime stability testing
-
-See:
-
-docs/research_roadmap.md
+Next experiments should avoid treating classification-aware constraints as fully production-grade until that work is complete.
 
 ---
 
@@ -134,5 +119,5 @@ When assisting with this project:
 4. Prefer small, interpretable changes.
 5. Return code changes as Codex prompts when possible.
 
-All experiments should update docs/experiment_log.md.
-Major research findings should also update docs/research_state.md.
+All experiments should update `docs/experiment_log.md`.
+Major research findings should also update `docs/research_state.md`.

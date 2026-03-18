@@ -12,6 +12,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from quant_lab.utils.env import load_project_env
+
 
 def _norm(raw: object) -> str:
     s = str(raw or "").strip().upper()
@@ -134,6 +136,7 @@ def main() -> None:
     p.add_argument("--staging-root", default="data/staging/phase2b")
     p.add_argument("--validation-root", default="results/data_validation")
     args = p.parse_args()
+    load_project_env()
 
     ts = datetime.now(UTC).strftime("%Y%m%d_%H%M%S")
     run_root = Path(args.staging_root) / ts

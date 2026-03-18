@@ -76,3 +76,23 @@ def test_gross_profitability_and_invalid_denominator() -> None:
 
 def test_factor_registered() -> None:
     assert "gross_profitability" in set(list_factors())
+
+
+def test_loader_floors_available_date_before_period_end(tmp_path) -> None:
+    src = pd.DataFrame(
+        [
+            {
+                "ticker": "AAA",
+                "period_end": "2024-12-31",
+                "available_date": "2024-12-15",
+                "gross_profit": 100.0,
+                "total_assets": 1000.0,
+            }
+        ]
+    )
+    p = tmp_path / "fundamentals_bad_dates.parquet"
+    src.to_parquet(p, index=False)
+    out = load_fundamentals_file(p, fallback_lag_days=45)
+    assert len(out) == 1
+    row = out.iloc[0]
+    assert pd.Timestamp(row["available_date"]) == pd.Timestamp("2024-12-31")

@@ -158,6 +158,20 @@ interpretation
 
 ---
 
+# 11. Classification-Dependent Research Guardrail
+
+Sector-neutral and industry-neutral research depends on `security_master` classification coverage.
+
+Until `sector` and `industry` coverage is materially improved:
+
+* sector-neutral research should remain disabled or flagged as experimental
+* industry-neutral research should remain disabled or flagged as experimental
+* classification-aware portfolio constraints should not be treated as production-grade defaults
+
+Incomplete classification metadata is not a blocker for canonical price-layer promotion.
+
+---
+
 # Current Status
 
 Quant Lab satisfies:
